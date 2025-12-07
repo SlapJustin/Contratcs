@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+/*
+---------------------------------------------------------
+ SlapJustin (SLAP)
+ - Total supply: 1,000,000,000 * 10^18
+ - 10% prefund to contract for staking rewards
+ - 10% APY staking (continuous time-based)
+ - 14-day unbonding period (cancelable)
+ - Built for BNB Smart Chain, compiler 0.8.26
+---------------------------------------------------------
+*/
+
+contract SlapJustin {
+    // Basic ERC20 variables
+    string public name = "SlapJustin";
+    string public symbol = "SLAP";
+    uint8  public decimals = 18;
+    uint256 public totalSupply;
+
+    // Owner
+    address public owner;
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    // Balances & allowances
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    // --- Staking parameters ---
+    uint256 public constant PREFUND_PERCENT   = 10;
+    uint256 public constant APY_PERCENT       = 10;
+    uint256 public constant UNBONDING_PERIOD  = 14 days;
+    uint256 private constant SECONDS_PER_YEAR = 365 days;
+
+    mapping(address => uint256) private _staked;
+    mapping(address => uint256) private _rewards;
+    mapping(address => uint256) private _lastUpdate;
+    mapping(address => uint256) private _unstakeAmt;
+    mapping(address => uint256) private _unstakeTime;
+
+    uint256 public totalStaked;
+
+    // --- Events ---
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+    event Staked(address indexed user, uint256 amount);
+    event UnstakeRequested(address indexed user, uint256 amount);
+    event Unstaked(address indexed user, uint256 amount);
+    event RewardsClaimed(address indexed user, uint256 amount);
+    event Funded(address indexed by, uint256 amount);
+
+    constructor() {
+        owner = msg.sender;
+        totalSupply = 1_000_000_000 * 10 ** uint256(decimals);
+        balanceOf[msg.sender] = totalSupply;
+
+        // Prefund 10% to contract for rewards
+        uint256 prefund = (totalSupply * PREFUND_PERCENT) / 100;
+        _transfer(msg.sender, address(this), prefund);
+        emit Funded(msg.sender, prefund);
+    }
+
+    // ---------- ERC20 ----------
+    function _transfer(address from, address to, uint256 amount) internal {
+        require(from != address(0) && to != address(0), "Invalid address");
+        require(balanceOf[from] >= amount, "Insufficient balance");
+        balanceOf[from] -= amount;
+        balanceOf[to]   += amount;
+        emit Transfer(from, to, amount);
+    }
+
+    function increaseAllowance(address spender, uint256 addedValue) external returns (bool) {
+    uint256 currentAllowance = allowance[msg.sender][spender];
+    allowance[msg.sender][spender] = currentAllowance + addedValue;
+    emit Approval(msg.sender, spender, allowance[msg.sender][spender]);
+    return true;
+}
+
+function decreaseAllowance(address spender, uint256 subtractedValue) external returns (bool) {
+    uint256 currentAllowance = allowance[msg.sender][spender];
+    require(currentAllowance >= subtractedValue, "Decreased allowance below zero");
+    allowance[msg.sender][spender] = currentAllowance - subtractedValue;
+    emit Approval(msg.sender, spender, allowance[msg.sender][spender]);
+    return true;
+}
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(allowance[from][msg.sender] >= amount, "Allowance too low");
+        allowance[from][msg.sender] -= amount;
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    // ---------- Reward logic ----------
+    function _update(address user) internal {
+        uint256 last   = _lastUpdate[user];
+        uint256 staked = _staked[user];
+        uint256 nowT   = block.timestamp;
+
+        if (staked > 0 && last > 0) {
+            uint256 dt      = nowT - last;
+            uint256 reward  = (staked * APY_PERCENT * dt) / (100 * SECONDS_PER_YEAR);
+            _rewards[user] += reward;
+        }
+        _lastUpdate[user] = nowT;
+    }
+    // ---------- Staking ----------
+    function stake(uint256 amount) external {
+        require(amount > 0, "Cannot stake 0");
+        require(balanceOf[msg.sender] >= amount, "Not enough balance");
+        _update(msg.sender);
+
+        _transfer(msg.sender, address(this), amount);
+        _staked[msg.sender] += amount;
+        totalStaked += amount;
+        emit Staked(msg.sender, amount);
+    }
+
+    function requestUnstake(uint256 amount) external {
+    require(amount > 0 && _staked[msg.sender] >= amount, "Invalid amount");
+    // Prevent overwriting existing unstake request
+    require(_unstakeAmt[msg.sender] == 0, "Existing unstake request pending");
+    _update(msg.sender);
+    _unstakeAmt[msg.sender]  = amount;
+    _unstakeTime[msg.sender] = block.timestamp;
+    emit UnstakeRequested(msg.sender, amount);
+}
+
+event UnstakeCancelled(address indexed user, uint256 amount);
+
+function cancelUnstake() external {
+    uint256 amount = _unstakeAmt[msg.sender];
+    require(amount > 0, "Nothing to cancel");
+    _unstakeAmt[msg.sender]  = 0;
+    _unstakeTime[msg.sender] = 0;
+    emit UnstakeCancelled(msg.sender, amount);
+}
+
+    function claimUnstaked() external {
+        uint256 amt = _unstakeAmt[msg.sender];
+        require(amt > 0, "Nothing pending");
+        require(block.timestamp >= _unstakeTime[msg.sender] + UNBONDING_PERIOD, "Still unbonding");
+
+        _update(msg.sender);
+        _unstakeAmt[msg.sender]  = 0;
+        _unstakeTime[msg.sender] = 0;
+        _staked[msg.sender] -= amt;
+        totalStaked -= amt;
+
+        _transfer(address(this), msg.sender, amt);
+        emit Unstaked(msg.sender, amt);
+    }
+
+    function claimRewards() external {
+        _update(msg.sender);
+        uint256 reward = _rewards[msg.sender];
+        require(reward > 0, "No rewards");
+        require(balanceOf[address(this)] >= reward, "Reward pool empty");
+
+        _rewards[msg.sender] = 0;
+        _transfer(address(this), msg.sender, reward);
+        emit RewardsClaimed(msg.sender, reward);
+    }
+
+    // ---------- Owner ----------
+    function fundRewards(uint256 amount) external onlyOwner {
+        _transfer(msg.sender, address(this), amount);
+        emit Funded(msg.sender, amount);
+    }
+
+    // ---------- View ----------
+    function stakedBalanceOf(address user) external view returns (uint256) {
+        return _staked[user];
+    }
+
+    function _calculateReward(uint256 staked, uint256 duration) private pure returns (uint256) {
+    return (staked * APY_PERCENT * duration) / (100 * SECONDS_PER_YEAR);
+}
+
+function _update(address user) internal {
+    uint256 last   = _lastUpdate[user];
+    uint256 staked = _staked[user];
+    uint256 nowT   = block.timestamp;
+
+    if (staked > 0 && last > 0) {
+        uint256 dt = nowT - last;
+        _rewards[user] += _calculateReward(staked, dt);
+    }
+    _lastUpdate[user] = nowT;
+}
+
+function pendingRewardsOf(address user) external view returns (uint256) {
+    uint256 last   = _lastUpdate[user];
+    uint256 staked = _staked[user];
+    if (staked == 0 || last == 0) return _rewards[user];
+    
+    uint256 dt = block.timestamp - last;
+    return _rewards[user] + _calculateReward(staked, dt);
+}
+
+    function unstakeInfoOf(address user) external view returns (uint256 amount, uint256 requestTime) {
+        return (_unstakeAmt[user], _unstakeTime[user]);
+    }
+}
